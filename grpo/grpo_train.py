@@ -9,7 +9,7 @@ import time
 import sys
 from pathlib import Path
 from copy import deepcopy
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -20,9 +20,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedul
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+PROJECT_DIR = CURRENT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from gsm8k_dataset import GSM8KJsonDataset, gsm8k_collate_fn
 from gsm8k_reward import compute_gsm8k_reward_batch
+from utils import resolve_model_path, select_device
 
 
 def masked_mean(tensor: torch.Tensor, mask: torch.BoolTensor, dim: int = -1) -> torch.Tensor:
@@ -40,7 +44,7 @@ def compute_log_probs(
     # shift: logits[t] predicts token[t+1]
     log_probs = F.log_softmax(logits[:, :-1, :], dim=-1)   # (B, S-1, V)
     token_ids = input_ids[:, 1:]                             # (B, S-1)
-    per_token_lp = log_probs.gather(2, token_ids.unsqueeze(-1)).squeeze(-1)  # (B, S-1)
+    per_token_lp = log_probs.gather(2, token_ids.unsqueeze(-1)).squeeze(-1)  # (B, S-1), gather chosen log_probs
 
     # action_mask is defined on response tokens (starting at prompt_len)
     return per_token_lp * action_mask  # zero out prompt positions
@@ -75,7 +79,7 @@ def compute_approx_kl(
 class GRPOTrainer:
     def __init__(self, args):
         self.args = args
-        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        self.device = select_device(args.device)
 
         assert args.ppo_mini_batch_size % args.ppo_micro_batch_size_per_gpu == 0, (
             f"ppo_mini_batch_size ({args.ppo_mini_batch_size}) must be divisible by "
@@ -84,14 +88,15 @@ class GRPOTrainer:
         self.grad_accum_steps = args.ppo_mini_batch_size // args.ppo_micro_batch_size_per_gpu
 
         # ── models ──
-        print(f"Loading model from {args.model_path} ...")
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        model_path = resolve_model_path(args.model_path)
+        print(f"Loading model from {model_path} on {self.device} ...", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
         self.actor = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
+            model_path,
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
             trust_remote_code=True,
         ).to(self.device)
@@ -220,8 +225,8 @@ class GRPOTrainer:
 
         return {
             "sequences":      sequences,         # (B*G, S)
-            "attention_mask": attention_mask,    # (B*G, S)
-            "action_mask":    action_mask,       # (B*G, S-1)
+            "attention_mask": attention_mask,    # (B*G, S), prevents seeing padding token
+            "action_mask":    action_mask,       # (B*G, S-1), prevents seeing prompts token
             "prompt_len":     prompt_len,
             "group_ids":      group_ids,         # (B*G, )
         }
@@ -577,7 +582,7 @@ def parse_args():
                         help="Path to eval JSON (same format as train). Used when eval_steps > 0.")
     parser.add_argument("--eval_batch_size", type=int, default=None,
                         help="Batch size for eval DataLoader. Defaults to train_batch_size when omitted.")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     args = parser.parse_args()
     if args.eval_batch_size is None:
         args.eval_batch_size = args.train_batch_size

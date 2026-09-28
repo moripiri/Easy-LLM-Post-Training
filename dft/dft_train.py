@@ -17,8 +17,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+PROJECT_DIR = CURRENT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from sft_dataset import JsonSFTDataset, SFTDataCollator
+from utils import resolve_model_path, select_device
 
 def compute_dft_loss(logits: torch.Tensor, labels: torch.Tensor, dft_alpha: float = 0.0) -> torch.Tensor:
     # Standard causal LM shift: predict token[t] from hidden state at t-1.
@@ -71,7 +75,7 @@ class BaseTrainer:
         self.train_loader = train_loader
         self.args = args
         self.state = TrainState()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = args.device
         self.model.to(self.device)
 
         self.optimizer = torch.optim.AdamW(
@@ -191,20 +195,23 @@ def parse_args():
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA.")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+    args.device = select_device(args.device)
+    model_path = resolve_model_path(args.model_path)
 
-    print("Loading model and tokenizer...")
+    print(f"Loading model and tokenizer from {model_path} on {args.device}...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
-        torch_dtype="auto",
+        torch_dtype=torch.float32,
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
     )
     if tokenizer.pad_token is None:

@@ -10,15 +10,18 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from contextlib import nullcontext
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # Ensure local dataset module can be imported no matter where this script is launched.
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+PROJECT_DIR = CURRENT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from sft_dataset import JsonSFTDataset, SFTDataCollator
+from utils import resolve_model_path, select_device
 
 
 def compute_sft_loss(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
@@ -49,7 +52,7 @@ class BaseTrainer:
         self.train_loader = train_loader
         self.args = args
         self.state = TrainState()
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = args.device
         self.model.to(self.device)
 
         self.optimizer = torch.optim.AdamW(
@@ -88,8 +91,6 @@ class BaseTrainer:
         torch.save(self.scheduler.state_dict(), os.path.join(ckpt_dir, "scheduler.pt"))
 
     def train(self):
-        scaler_enabled = torch.cuda.is_available() and self.args.bf16
-        autocast_dtype = torch.bfloat16 if scaler_enabled else None
         self.model.train()
         self.optimizer.zero_grad(set_to_none=True)
 
@@ -99,13 +100,7 @@ class BaseTrainer:
             for step, batch in enumerate(self.train_loader, start=1):
                 self.state.global_step += 1
                 batch = move_batch_to_device(batch, self.device)
-
-                if torch.cuda.is_available():
-                    with torch.autocast(device_type="cuda", dtype=autocast_dtype, enabled=scaler_enabled):
-                        loss = self.get_batch_metrics(batch, train=True)
-                else:
-                    with nullcontext():
-                        loss = self.get_batch_metrics(batch, train=True)
+                loss = self.get_batch_metrics(batch, train=True)
 
                 loss_to_backward = loss / self.args.gradient_accumulation_steps
                 loss_to_backward.backward()
@@ -169,20 +164,29 @@ def parse_args():
     parser.add_argument("--logging_steps", type=int, default=10)
     parser.add_argument("--save_steps", type=int, default=200)
     parser.add_argument("--num_workers", type=int, default=0)
-    parser.add_argument("--bf16", action="store_true", help="Use bfloat16 autocast on CUDA.")
+    parser.add_argument(
+        "--device",
+        choices=("auto", "cuda", "mps", "cpu"),
+        default="auto",
+        help="Training device. Use mps to require Apple Metal acceleration.",
+    )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    print("Loading model and tokenizer...")
+    args.device = select_device(args.device)
+    print(f"Using device: {args.device}", flush=True)
+    model_path = resolve_model_path(args.model_path)
+
+    print(f"Loading model and tokenizer from {model_path}...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
-        torch_dtype="auto",
+        torch_dtype=torch.float32,
     )
     tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
     )
     if tokenizer.pad_token is None:
@@ -201,6 +205,7 @@ def main():
         num_workers=args.num_workers,
         collate_fn=data_collator,
     )
+    print(f"Dataset ready: {len(train_dataset)} samples, device={args.device}", flush=True)
 
     trainer = SFTTrainer(
         model=model,

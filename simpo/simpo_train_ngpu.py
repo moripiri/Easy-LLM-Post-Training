@@ -20,8 +20,12 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+PROJECT_DIR = CURRENT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from dpo_dataset import JsonDPODataset, DPODataCollator
+from utils import resolve_model_path
 
 
 def _get_batch_logps(
@@ -294,12 +298,13 @@ def main():
 
     if rank == 0:
         print("Loading policy, and tokenizer...")
+    model_path = resolve_model_path(args.model_path)
     policy = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
+        model_path,
         trust_remote_code=True,
         torch_dtype="auto",
     )
-    tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 

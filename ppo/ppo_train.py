@@ -20,9 +20,13 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, get_linear_schedul
 CURRENT_DIR = Path(__file__).resolve().parent
 if str(CURRENT_DIR) not in sys.path:
     sys.path.insert(0, str(CURRENT_DIR))
+PROJECT_DIR = CURRENT_DIR.parent
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
 
 from gsm8k_dataset import GSM8KJsonDataset, gsm8k_collate_fn
 from gsm8k_reward import compute_gsm8k_reward_batch
+from utils import resolve_model_path, select_device
 
 
 def masked_mean(tensor: torch.Tensor, mask: torch.BoolTensor, dim: int = -1) -> torch.Tensor:
@@ -105,7 +109,7 @@ def compute_gae(
 class PPOTrainer:
     def __init__(self, args):
         self.args = args
-        self.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+        self.device = select_device(args.device)
 
         # validate micro/mini batch sizes
         assert args.ppo_mini_batch_size % args.ppo_micro_batch_size_per_gpu == 0, (
@@ -115,21 +119,22 @@ class PPOTrainer:
         self.grad_accum_steps = args.ppo_mini_batch_size // args.ppo_micro_batch_size_per_gpu
 
         # ── models ──
-        print(f"Loading model from {args.model_path} ...")
-        self.tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
+        model_path = resolve_model_path(args.model_path)
+        print(f"Loading model from {model_path} on {self.device} ...", flush=True)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"  # left-pad for generation
 
         self.actor = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
+            model_path,
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
             trust_remote_code=True,
         ).to(self.device)
 
         # Critic: lightweight value head on top of a llm backbone
         self.critic_backbone = AutoModelForCausalLM.from_pretrained(
-            args.model_path,
+            model_path,
             torch_dtype=torch.bfloat16 if args.bf16 else torch.float32,
             trust_remote_code=True,
         ).to(self.device)
@@ -683,7 +688,7 @@ def parse_args():
                         help="Path to eval JSON (same format as train). Used when eval_steps > 0.")
     parser.add_argument("--eval_batch_size", type=int, default=None,
                         help="Batch size for eval DataLoader. Defaults to train_batch_size when omitted.")
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", choices=("auto", "cuda", "mps", "cpu"), default="auto")
     args = parser.parse_args()
     if args.eval_batch_size is None:
         args.eval_batch_size = args.train_batch_size
@@ -698,4 +703,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
